@@ -162,3 +162,10 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+#click to find most similar poses
+#count gestures and timestamps
+#screenshots on poses
+#remove false flags
+#timer to allow removal of windows 
+#trace selected poses with red line to show movement
