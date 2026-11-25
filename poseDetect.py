@@ -1,88 +1,173 @@
+import ctypes
+from ctypes import wintypes
+import tkinter as tk
+
 import cv2
 import mss
 import numpy as np
 import mediapipe as mp
 
-# initialise
+# make coordinates match real pixels on high-DPI screens
+try:
+    ctypes.windll.shcore.SetProcessDpiAwareness(2)
+except Exception:
+    ctypes.windll.user32.SetProcessDPIAware()
+
+user32 = ctypes.windll.user32
+user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+user32.GetAncestor.restype = wintypes.HWND
+user32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
+user32.GetWindowLongW.restype = ctypes.c_long
+user32.SetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_long]
+user32.SetWindowDisplayAffinity.argtypes = [wintypes.HWND, wintypes.DWORD]
+
 mp_pose = mp.solutions.pose
-mp_draw = mp.solutions.drawing_utils
 
-MONITOR_INDEX = 1      # 1 = primary monitor, 2 = second monitor, 0 = all monitors combined
-REGION = None          # or a region, e.g. {"left": 0, "top": 0, "width": 1280, "height": 720}
-SCALE = 0.5            # shrink frames before processing; faster, lower = less accurate for small people
-RECORD = False         # True to also save the annotated output to a file
-OUTPUT_FILE = "screen_pose.mp4"
-FPS = 20
+KEY = "#010101"          # colour that becomes see-through on the overlay
+LINE_COLOUR = "#00ff00"
+POINT_COLOUR = "#ff3030"
+BOX_COLOUR = "#00ffff"
+MAX_PROCESS_WIDTH = 640  # frames are shrunk to this width before detection (speed)
+MIN_VISIBILITY = 0.5     # hide landmarks the model isn't confident about
 
-with mss.mss() as sct:
-    monitor = REGION or sct.monitors[MONITOR_INDEX]
 
-    writer = None
+def esc_pressed():
+    return bool(user32.GetAsyncKeyState(0x1B) & 0x8000)
 
-    # initialise detector
-    with mp_pose.Pose(
-        min_detection_confidence=0.5,
-        min_tracking_confidence=0.5
-    ) as pose:
 
-        cv2.namedWindow("Screen pose detection", cv2.WINDOW_NORMAL)
-        cv2.resizeWindow("Screen pose detection", 640, 360)
+def make_overlay_window(win):
+    """Click-through, always on top, and invisible to screen capture."""
+    win.update_idletasks()
+    hwnd = user32.GetAncestor(win.winfo_id(), 2)  # GA_ROOT
+    GWL_EXSTYLE = -20
+    WS_EX_LAYERED, WS_EX_TRANSPARENT, WS_EX_TOOLWINDOW = 0x80000, 0x20, 0x80
+    style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+    user32.SetWindowLongW(hwnd, GWL_EXSTYLE,
+                          style | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW)
+    # stops the overlay appearing in the screen grab (Windows 10 2004+)
+    if not user32.SetWindowDisplayAffinity(hwnd, 0x11):  # WDA_EXCLUDEFROMCAPTURE
+        print("Warning: couldn't hide the overlay from capture; "
+              "you may see flicker or feedback.")
 
-        while True:
-            # grab the screen (BGRA) and convert to BGR
-            shot = np.array(sct.grab(monitor))
-            frame = cv2.cvtColor(shot, cv2.COLOR_BGRA2BGR)
 
-            if SCALE != 1.0:
-                frame = cv2.resize(frame, None, fx=SCALE, fy=SCALE,
-                                   interpolation=cv2.INTER_AREA)
+def select_region(root, virtual):
+    """Full-screen dim layer; drag a rectangle; returns a dict for mss or None."""
+    vl, vt, vw, vh = virtual["left"], virtual["top"], virtual["width"], virtual["height"]
+    chosen = {}
 
-            h, w = frame.shape[:2]
+    sel = tk.Toplevel(root)
+    sel.overrideredirect(True)
+    sel.geometry(f"{vw}x{vh}+{vl}+{vt}")
+    sel.attributes("-topmost", True)
+    sel.attributes("-alpha", 0.3)
+    canvas = tk.Canvas(sel, bg="black", highlightthickness=0, cursor="crosshair")
+    canvas.pack(fill="both", expand=True)
+    canvas.create_text(vw // 2, 40, fill="white", font=("Segoe UI", 18),
+                       text="Drag a box around the area to track  (Esc to cancel)")
 
-            # frame colours
-            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    state = {"x0": 0, "y0": 0, "rect": None}
 
-            results = pose.process(rgb_frame)
+    def on_press(e):
+        state["x0"], state["y0"] = e.x_root, e.y_root
+        state["rect"] = canvas.create_rectangle(0, 0, 0, 0, outline="red", width=3)
 
-            if results.pose_landmarks:
-                # draw landmarks
-                mp_draw.draw_landmarks(
-                    frame,
-                    results.pose_landmarks,
-                    mp_pose.POSE_CONNECTIONS
-                )
+    def on_drag(e):
+        if state["rect"] is not None:
+            canvas.coords(state["rect"],
+                          state["x0"] - vl, state["y0"] - vt,
+                          e.x_root - vl, e.y_root - vt)
 
-                # bounding box around the person
-                xs = [lm.x * w for lm in results.pose_landmarks.landmark]
-                ys = [lm.y * h for lm in results.pose_landmarks.landmark]
-                x1, x2 = int(max(min(xs), 0)), int(min(max(xs), w - 1))
-                y1, y2 = int(max(min(ys), 0)), int(min(max(ys), h - 1))
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                cv2.putText(frame, "Person", (x1, max(y1 - 10, 20)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+    def on_release(e):
+        x0, y0, x1, y1 = state["x0"], state["y0"], e.x_root, e.y_root
+        chosen.update(left=min(x0, x1), top=min(y0, y1),
+                      width=abs(x1 - x0), height=abs(y1 - y0))
+        sel.destroy()
 
-                status = "Person detected"
-            else:
-                status = "No person"
+    canvas.bind("<ButtonPress-1>", on_press)
+    canvas.bind("<B1-Motion>", on_drag)
+    canvas.bind("<ButtonRelease-1>", on_release)
+    sel.bind("<Escape>", lambda e: sel.destroy())
+    sel.focus_force()
 
-            cv2.putText(frame, status, (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+    root.wait_window(sel)
+    if chosen.get("width", 0) < 50 or chosen.get("height", 0) < 50:
+        return None
+    return chosen
 
-            # optional recording of the annotated frames
-            if RECORD:
-                if writer is None:
-                    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                    writer = cv2.VideoWriter(OUTPUT_FILE, fourcc, FPS, (w, h))
-                writer.write(frame)
 
-            # display image
-            cv2.imshow("Screen pose detection", frame)
+def main():
+    root = tk.Tk()
+    root.withdraw()
 
-            if cv2.waitKey(1) & 0xFF == 27:  # Esc to quit
-                break
+    with mss.mss() as sct:
+        region = select_region(root, sct.monitors[0])  # monitors[0] = all screens
+        if region is None:
+            print("No region selected.")
+            return
 
-    if writer is not None:
-        writer.release()
+        left, top, w, h = region["left"], region["top"], region["width"], region["height"]
 
-# end
-cv2.destroyAllWindows()
+        # transparent, click-through overlay exactly over the chosen region
+        overlay = tk.Toplevel(root)
+        overlay.overrideredirect(True)
+        overlay.geometry(f"{w}x{h}+{left}+{top}")
+        overlay.attributes("-topmost", True)
+        overlay.attributes("-transparentcolor", KEY)
+        canvas = tk.Canvas(overlay, width=w, height=h, bg=KEY, highlightthickness=0)
+        canvas.pack()
+        canvas.create_rectangle(1, 1, w - 2, h - 2, outline="red", width=2)  # region border
+        make_overlay_window(overlay)
+
+        print("Tracking. Press Esc to quit.")
+
+        with mp_pose.Pose(min_detection_confidence=0.5,
+                          min_tracking_confidence=0.5) as pose:
+
+            def tick():
+                if esc_pressed():
+                    root.destroy()
+                    return
+
+                frame = np.array(sct.grab(region))
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGRA2RGB)
+                if w > MAX_PROCESS_WIDTH:
+                    scale = MAX_PROCESS_WIDTH / w
+                    rgb = cv2.resize(rgb, None, fx=scale, fy=scale,
+                                     interpolation=cv2.INTER_AREA)
+
+                results = pose.process(rgb)
+                canvas.delete("pose")
+
+                if results.pose_landmarks:
+                    lms = results.pose_landmarks.landmark
+                    pts = [(lm.x * w, lm.y * h, lm.visibility) for lm in lms]
+
+                    for a, b in mp_pose.POSE_CONNECTIONS:
+                        if pts[a][2] > MIN_VISIBILITY and pts[b][2] > MIN_VISIBILITY:
+                            canvas.create_line(pts[a][0], pts[a][1], pts[b][0], pts[b][1],
+                                               fill=LINE_COLOUR, width=3, tags="pose")
+
+                    visible = [p for p in pts if p[2] > MIN_VISIBILITY]
+                    for x, y, _ in visible:
+                        canvas.create_oval(x - 4, y - 4, x + 4, y + 4,
+                                           fill=POINT_COLOUR, outline="", tags="pose")
+
+                    if visible:
+                        x1 = max(min(p[0] for p in visible), 0)
+                        y1 = max(min(p[1] for p in visible), 0)
+                        x2 = min(max(p[0] for p in visible), w)
+                        y2 = min(max(p[1] for p in visible), h)
+                        canvas.create_rectangle(x1, y1, x2, y2, outline=BOX_COLOUR,
+                                                width=2, tags="pose")
+                        canvas.create_text(x1 + 4, max(y1 - 12, 10), text="Person",
+                                           fill=BOX_COLOUR, anchor="w",
+                                           font=("Segoe UI", 12, "bold"), tags="pose")
+
+                root.after(1, tick)
+
+            root.after(0, tick)
+            root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
