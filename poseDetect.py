@@ -152,16 +152,7 @@ def main():
                         canvas.create_oval(x - 4, y - 4, x + 4, y + 4,
                                            fill=POINT_COLOUR, outline="", tags="pose")
 
-                    if visible:
-                        x1 = max(min(p[0] for p in visible), 0)
-                        y1 = max(min(p[1] for p in visible), 0)
-                        x2 = min(max(p[0] for p in visible), w)
-                        y2 = min(max(p[1] for p in visible), h)
-                        canvas.create_rectangle(x1, y1, x2, y2, outline=BOX_COLOUR,
-                                                width=2, tags="pose")
-                        canvas.create_text(x1 + 4, max(y1 - 12, 10), text="Person",
-                                           fill=BOX_COLOUR, anchor="w",
-                                           font=("Segoe UI", 12, "bold"), tags="pose")
+
 
                 root.after(1, tick)
 
